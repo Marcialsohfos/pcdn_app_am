@@ -441,15 +441,39 @@ def run_generic_qa(gdf: gpd.GeoDataFrame, layer: str, struct: pd.DataFrame | Non
 
 
 # ---------------------------------------------------------------- synthèse
+def _empty_issues() -> pd.DataFrame:
+    return pd.DataFrame(columns=COLS)
+
+
+def _as_issues(issues) -> pd.DataFrame:
+    """Tolère None / DataFrame sans colonnes : le diagnostic ne doit jamais empêcher l'affichage des données."""
+    if issues is None or not isinstance(issues, pd.DataFrame) or "layer" not in issues.columns:
+        return _empty_issues()
+    return issues
+
+
+def _qa_failure(layer: str, e: Exception) -> pd.DataFrame:
+    """Un contrôle qui plante ne bloque rien : l'échec est consigné comme anomalie visible (données inchangées)."""
+    msg = f"Diagnostic non réalisé pour cette couche ({type(e).__name__}: {e}). Les données restent exportées telles quelles."
+    return pd.DataFrame([(layer, None, None, None, None, "", "QA_INTERNAL", "ERROR", msg, "", None, None, None)], columns=COLS)
+
+
 def run_all_qa(layers: dict, domains: dict, struct: pd.DataFrame | None = None, dup_tol_m=3.0) -> pd.DataFrame:
-    parts = [run_layer_qa(g, l, domains, dup_tol_m, struct) if l in LAYERS else run_generic_qa(g, l, struct)
-             for l, g in layers.items()]
+    parts = []
+    for l, g in layers.items():
+        try:
+            parts.append(run_layer_qa(g, l, domains, dup_tol_m, struct) if l in LAYERS else run_generic_qa(g, l, struct))
+        except Exception as e:  # noqa
+            parts.append(_qa_failure(l, e))
     if struct is not None and len(struct):  # anomalies de fichiers sans couche (téléchargement échoué…)
         orphan = struct[~struct.layer.isin(list(layers))]
         if len(orphan):
             parts.append(pd.DataFrame([(r.layer or "(fichier)", None, None, r.zone, None, r.field, r.rule, r.severity,
                                         r.message, "", None, r.fichier, None) for r in orphan.itertuples()], columns=COLS))
-    parts.append(run_cross_qa(layers, domains))
+    try:
+        parts.append(run_cross_qa(layers, domains))
+    except Exception as e:  # noqa
+        parts.append(_qa_failure("(inter-couches)", e))
     out = pd.concat([p for p in parts if len(p)], ignore_index=True) if any(len(p) for p in parts) else pd.DataFrame(columns=COLS)
     out["severity"] = pd.Categorical(out["severity"], ["ERROR", "WARNING", "INFO"], ordered=True)
     return out.sort_values(["layer", "severity", "rule"], kind="stable").reset_index(drop=True)
@@ -457,6 +481,7 @@ def run_all_qa(layers: dict, domains: dict, struct: pd.DataFrame | None = None, 
 
 def status_series(issues: pd.DataFrame, layer: str) -> pd.Series:
     """Statut de diagnostic par entité (index = _rid) : OK / WARNING / ERROR. Sert à l'affichage uniquement."""
+    issues = _as_issues(issues)
     sub = issues[(issues.layer == layer) & issues["_rid"].notna() & (issues.severity != "INFO")]
     if sub.empty:
         return pd.Series(dtype=object)
@@ -464,6 +489,7 @@ def status_series(issues: pd.DataFrame, layer: str) -> pd.Series:
 
 
 def summarize(layers: dict, issues: pd.DataFrame) -> pd.DataFrame:
+    issues = _as_issues(issues)
     rows = []
     for name, g in layers.items():
         sub = issues[(issues.layer == name) & issues["_rid"].notna()]
